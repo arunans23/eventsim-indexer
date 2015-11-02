@@ -129,7 +129,7 @@ public class LogIndexer {
         .withArgName("#")
         .hasArg()
         .isRequired(false)
-        .withDescription("Number of shards to use when using the hash-based routing scheme; default is 48")
+        .withDescription("Number of shards to use when using the hash-based routing scheme; default is 2")
         .create("numShards"),
       OptionBuilder
         .withArgName("#")
@@ -191,7 +191,7 @@ public class LogIndexer {
   protected String configName = "sgconf2";
   protected String fusionUrl = "http://localhost:8765/api/v1/collections";
   protected String shardScheme;
-  protected int numShards = 48;
+  protected int numShards = 2;
   protected int batchSize = 3000;
   protected boolean watch = false;
   protected boolean deleteAfterIndexing = true;
@@ -238,10 +238,9 @@ public class LogIndexer {
     shardScheme = cli.getOptionValue("shardScheme", "hash");
 
     if ("hash".equals(shardScheme)) {
-      numShards = Integer.parseInt(cli.getOptionValue("numShards","48"));
+      numShards = Integer.parseInt(cli.getOptionValue("numShards","2"));
       batchSize = Integer.parseInt(cli.getOptionValue("batchSize","3000"));
       fixedCollectionName = cli.getOptionValue("collection");
-
       log.info("Configured to use hash-based document routing scheme");
     } else {
       numShards = 24;
