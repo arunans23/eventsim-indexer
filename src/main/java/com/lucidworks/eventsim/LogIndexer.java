@@ -2,6 +2,8 @@ package com.lucidworks.eventsim;
 
 import com.codahale.metrics.*;
 import com.codahale.metrics.Timer;
+import com.fasterxml.jackson.core.JsonParseException;
+import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import org.apache.commons.cli.CommandLine;
 import org.apache.commons.cli.GnuParser;
@@ -20,7 +22,10 @@ import org.apache.http.entity.StringEntity;
 import org.apache.http.impl.auth.BasicScheme;
 import org.apache.http.impl.client.DefaultHttpClient;
 import org.apache.http.protocol.HttpContext;
-import org.apache.log4j.Logger;
+import org.apache.solr.client.solrj.request.schema.SchemaRequest;
+import org.apache.solr.client.solrj.response.schema.SchemaResponse;
+import org.slf4j.LoggerFactory;
+import org.slf4j.Logger;
 
 import java.io.*;
 import java.net.ConnectException;
@@ -53,6 +58,8 @@ import org.noggit.ObjectBuilder;
 
 import com.codahale.metrics.MetricRegistry;
 
+import javax.xml.validation.SchemaFactory;
+
 
 /**
  * Command-line utility for indexing eventsim data
@@ -63,7 +70,7 @@ public class LogIndexer {
     TimeZone.setDefault(TimeZone.getTimeZone("UTC"));
   }
 
-  public static Logger log = Logger.getLogger(LogIndexer.class);
+  public static Logger log = LoggerFactory.getLogger(LogIndexer.class);
 
   private static final String ZK_HOST = "localhost:2181";
 
@@ -158,7 +165,13 @@ public class LogIndexer {
         .hasArg()
         .isRequired(false)
         .withDescription("Name of existing collection")
-        .create("collection")
+        .create("collection"),
+      OptionBuilder
+        .withArgName("FILE_NAME")
+        .hasArg()
+        .isRequired(false)
+        .withDescription("Schema file to read and create fields")
+        .create("schemaFile")
     };
   }
 
@@ -196,6 +209,7 @@ public class LogIndexer {
   protected boolean watch = false;
   protected boolean deleteAfterIndexing = true;
   protected String fixedCollectionName = null;
+  protected String schemaFile;
 
   private static final MetricRegistry metrics = new MetricRegistry();
   private static final Timer sendBatchToSolrTimer = metrics.timer("sendBatchToSolr");
@@ -280,9 +294,20 @@ public class LogIndexer {
 
     String zkHost = cli.getOptionValue("zkHost", ZK_HOST);
     log.info("Connecting to Solr cluster: " + zkHost);
+
     try {
       cloudClient = new CloudSolrClient(zkHost);
       cloudClient.connect();
+
+      // Declare fields from user defined schema
+      if (cli.hasOption("schemaFile")) {
+        schemaFile = cli.getOptionValue("schemaFile");
+        if (fixedCollectionName != null) {
+          cloudClient.setDefaultCollection(fixedCollectionName);
+          defineSchema(schemaFile);
+        }
+      }
+
       log.info("Connected. Processing log files in " + logDir.getAbsolutePath());
       processLogDir(cloudClient, logDir, gzFiles, alreadyProcessedFiles, restartAtLine);
     } finally {
@@ -317,6 +342,43 @@ public class LogIndexer {
         }
       }
     }
+  }
+
+  private void defineSchema(String fileName) throws Exception {
+    log.info("Reading file: " + fileName);
+    List<Map<String, Object>> fieldDefinitions = jsonMapper.readValue(new File(fileName), new TypeReference<List<Map<String, Object>>>(){});
+    Map<String, Object> existingFields = getSchemaFromSolr();
+    log.info("Fields already defined in Solr schema" + existingFields.entrySet());
+    for (Map<String, Object> fD : fieldDefinitions) {
+      assert fD.containsKey("name");
+      String name = (String) fD.get("name");
+      // Check if the field exists in Solr. Otherwise create it
+      if(!existingFields.containsKey(name)) {
+        // Add the field to Solr
+        SchemaRequest.AddField addFieldRequest = new SchemaRequest.AddField(fD);
+        SchemaResponse.UpdateResponse updateResponse = addFieldRequest.process(cloudClient);
+        if (updateResponse.getStatus() != 0) {
+          throw new Exception("Incorrect status response from Solr. Errors are: " + updateResponse.getResponse().get("errors"));
+        }
+        log.info("Added field definition: " + fD.toString());
+      }
+    }
+  }
+
+  private Map<String, Object> getSchemaFromSolr() throws Exception {
+    log.info("Requesting schema fields from Solr");
+    SchemaRequest.Fields fields = new SchemaRequest.Fields();
+    SchemaResponse.FieldsResponse initialResponse = fields.process(cloudClient);
+    if (initialResponse.getStatus() != 0) {
+      throw new Exception("Incorrect status response from Solr. Errors are: " + initialResponse.getResponse().get("errors"));
+    }
+    List<Map<String, Object>> fieldResponses = initialResponse.getFields();
+    Map<String, Object> formattedResponse = new HashMap<>();
+    for (Map<String, Object> fieldResponse: fieldResponses) {
+      String name = (String) fieldResponse.get("name");
+      formattedResponse.put(name, fieldResponse);
+    }
+    return formattedResponse;
   }
 
   class DirectoryWatcherThread extends Thread {
@@ -626,7 +688,6 @@ public class LogIndexer {
                 batchMap.put(coll, batch);
               }
               batch.add(doc);
-
               if (batch.size() >= batchSize) {
                 logIndexer.indexBatch(batch, coll);
               }
@@ -669,6 +730,7 @@ public class LogIndexer {
       logIndexer.onFinishedParsingFile(fileName, lineNum, skippedLines, System.currentTimeMillis() - startMs);
     }
   }
+
 
   protected void onFinishedParsingFile(String fileName, int lineNum, int skippedLines, long tookMs) {
     log.info("Finished processing log file " + fileName + ", took " + tookMs + " ms; skipped " + skippedLines + " out of " + lineNum + " lines");
@@ -799,7 +861,7 @@ public class LogIndexer {
           } catch (Exception exc) {
             // maybe already created by another instance of this app
             // so re-check for existing before failing ...
-            zkStateReader.updateClusterState(true);
+            zkStateReader.updateLiveNodes();
             if (!zkStateReader.getClusterState().hasCollection(collectionAndShard[0])) {
               log.error("Failed to create collection '"+collectionAndShard[0]+"' due to: "+exc);
               throw exc;
@@ -826,7 +888,7 @@ public class LogIndexer {
         } catch (org.apache.solr.common.SolrException se) {
           log.error("Failed to get leader for collection " +
             collectionAndShard[0] + " shard " + collectionAndShard[1] + " due to: " + se + "; trying again after updating ClusterState");
-          zkStateReader.updateClusterState(true);
+          zkStateReader.updateLiveNodes();
 
           if ("hash".equals(shardScheme)) {
             leader = cloudClient;
@@ -895,7 +957,7 @@ public class LogIndexer {
   };
 
   protected String[] getTimeBasedShardForDoc(SolrInputDocument doc) {
-    Date timestamp_tdt = (Date) doc.getFieldValue("timestamp_tdt");
+    Date timestamp_tdt = (Date) doc.getFieldValue("timestamp");
     Calendar cal = Calendar.getInstance();
     cal.setTime(timestamp_tdt);
     String monthKey = months[cal.get(Calendar.MONTH)];
@@ -950,7 +1012,7 @@ public class LogIndexer {
       }
     }
 
-    Object tsObj = doc.getFieldValue("ts_l");
+    Object tsObj = doc.getFieldValue("ts");
     if (tsObj == null) {
       doc.setField("json", line);
       doc.setField("invalid_json_b", Boolean.TRUE);
@@ -963,14 +1025,14 @@ public class LogIndexer {
 
     String docId = timestampDate.getTime() + "_" + fileName + "_" + lineNum;
     doc.setField("id", docId);
-    doc.setField("timestamp_tdt", timestampDate);
+    doc.setField("timestamp", timestampDate);
 
-    Object reg = doc.getFieldValue("registration_l");
+    Object reg = doc.getFieldValue("registration");
     if (reg != null) {
       Date regDate = asDate(reg);
       if (regDate != null) {
-        doc.removeField("registration_l");
-        doc.setField("registration_tdt", regDate);
+        doc.removeField("registration");
+        doc.setField("registration", regDate);
       }
     }
 
@@ -1034,7 +1096,7 @@ public class LogIndexer {
         }
 
         // anything that looks like a time, but not a timestamp_tdt
-        if ("time".equals(fname) || (fname.indexOf("time") != -1 && fname.indexOf("timestamp_tdt") == -1)) {
+        if ("time".equals(fname) || (fname.indexOf("time") != -1 && fname.indexOf("timestamp") == -1)) {
           try {
             Float timeF = new Float(node.asText());
             doc.addField(fname + "_f", timeF);
@@ -1073,12 +1135,13 @@ public class LogIndexer {
         if (node.isArray()) {
           // TODO: treating all multi-valued fields as strings
           for (int v = 0; v < node.size(); v++) {
-            doc.addField(fname + "_ss", node.get(v).asText());
+            doc.addField(fname, node.get(v).asText());
           }
         } else {
           addJsonObjectFieldsToDoc(node, fname, doc);
         }
       } else {
+
         String solrFieldName = getSolrFieldNameForSingleValuedNode(node, fname);
         Object value = getFieldValueForSingleValuedNode(node);
         if (value != null)
@@ -1095,6 +1158,10 @@ public class LogIndexer {
 
   protected String getSolrFieldNameForSingleValuedNode(JsonNode node, String baseName) {
     baseName = baseName.replace('-', '_').replace(' ', '_');
+    // Do not add extensions if a schema file is provided at command line
+    if (schemaFile != null) {
+      return baseName;
+    }
     if (node.isNumber()) {
       if (node.isIntegralNumber()) {
         return baseName + "_l"; // long
